@@ -280,6 +280,7 @@ func GetConnectors() []ConnectorType {
 		genericURIConnector("abra", "ABRA Flexi", []string{"abra", "flexibee"}, true, false),
 		genericURIConnector("adjust", "Adjust", []string{"adjust"}, true, false),
 		genericURIConnector("adapty", "Adapty", []string{"adapty"}, true, false),
+		genericURIConnector("adyen", "Adyen", []string{"adyen"}, true, false),
 		genericURIConnector("airtable", "Airtable", []string{"airtable"}, true, false),
 		genericURIConnector("allium", "Allium", []string{"allium"}, true, false),
 		genericURIConnector("amplitude", "Amplitude", []string{"amplitude"}, true, false),
