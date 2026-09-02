@@ -65,6 +65,7 @@ Use this page to browse platforms by category. The sidebar keeps the full alphab
 - [Shopify](/supported-sources/shopify.md)
 - [Solidgate](/supported-sources/solidgate.md)
 - [Stripe](/supported-sources/stripe.md)
+- [wflow](/supported-sources/wflow.md)
 - [Wise](/supported-sources/wise.md)
 
 ## Work management, productivity, and operations
