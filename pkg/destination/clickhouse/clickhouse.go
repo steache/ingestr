@@ -28,10 +28,12 @@ import (
 )
 
 type ClickHouseDestination struct {
-	conn           driver.Conn
-	uri            string
-	database       string
-	engineType     string
+	conn       driver.Conn
+	uri        string
+	database   string
+	engineType string
+	// cluster is the ON CLUSTER target. Empty means single-node: no DDL below changes.
+	cluster        string
 	engineSettings map[string]string
 }
 
@@ -44,7 +46,7 @@ func (d *ClickHouseDestination) Schemes() []string {
 }
 
 func (d *ClickHouseDestination) Connect(ctx context.Context, uri string) error {
-	opts, database, engineType, engineSettings, err := parseClickHouseURI(uri)
+	opts, database, engineType, engineSettings, cluster, err := parseClickHouseURI(uri)
 	if err != nil {
 		return fmt.Errorf("failed to parse ClickHouse URI: %w", err)
 	}
@@ -63,6 +65,7 @@ func (d *ClickHouseDestination) Connect(ctx context.Context, uri string) error {
 	d.uri = uri
 	d.database = database
 	d.engineType = engineType
+	d.cluster = cluster
 	d.engineSettings = engineSettings
 	config.Debug("[CLICKHOUSE] Connected to database: %s (engine=%q, settings=%v)", database, engineType, engineSettings)
 	return nil
@@ -99,7 +102,7 @@ func (d *ClickHouseDestination) PrepareTable(ctx context.Context, opts destinati
 	}
 
 	startCreate := time.Now()
-	createSQL := buildCreateTableSQL(database, tableName, opts.Schema.Columns, opts.PrimaryKeys, d.engineType, d.engineSettings)
+	createSQL := buildCreateTableSQLForCluster(database, tableName, opts.Schema.Columns, opts.PrimaryKeys, d.engineType, d.engineSettings, d.cluster)
 	config.Debug("[CLICKHOUSE] CREATE SQL: %s", createSQL)
 	if err := d.conn.Exec(ctx, createSQL); err != nil {
 		config.LogFailedQuery(createSQL, err)
@@ -115,7 +118,11 @@ func (d *ClickHouseDestination) ensureDatabaseExists(ctx context.Context, databa
 		return nil
 	}
 
-	createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdentifier(database))
+	// ⚠️ ON CLUSTER TOO, OR THE TABLES BELOW HAVE NOWHERE TO LAND. Creating tables
+	// ON CLUSTER while their database exists on the connected replica only fails on every
+	// other replica with "Code: 81 ... Database <db> does not exist" — which is how the
+	// staging database broke the first time this was tried (2026-08-31).
+	createDBSQL := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s%s", quoteIdentifier(database), onCluster(d.cluster))
 	if err := d.conn.Exec(ctx, createDBSQL); err != nil {
 		config.LogFailedQuery(createDBSQL, err)
 		return fmt.Errorf("failed to create database %s: %w", database, err)
@@ -219,25 +226,28 @@ func (d *ClickHouseDestination) SwapTable(ctx context.Context, opts destination.
 		return fmt.Errorf("failed to ensure target database exists: %w", err)
 	}
 
-	exchangeSQL := fmt.Sprintf("EXCHANGE TABLES %s.%s AND %s.%s", quoteIdentifier(stagingDB), quoteIdentifier(stagingName), quoteIdentifier(targetDB), quoteIdentifier(targetName))
+	// ⚠️ ON CLUSTER OR THE SWAP APPLIES TO ONE REPLICA ONLY. Without it the connected
+	// replica ends up holding the former staging table while every other replica keeps the
+	// original — diverging silently, with the run reporting success.
+	exchangeSQL := fmt.Sprintf("EXCHANGE TABLES %s.%s AND %s.%s%s", quoteIdentifier(stagingDB), quoteIdentifier(stagingName), quoteIdentifier(targetDB), quoteIdentifier(targetName), onCluster(d.cluster))
 	if err := d.conn.Exec(ctx, exchangeSQL); err != nil {
 		config.Debug("[CLICKHOUSE] EXCHANGE TABLES failed, falling back to RENAME: %v", err)
 
 		oldNameCandidate := fmt.Sprintf("%s_old_%d", targetName, time.Now().UnixNano())
 		oldName := destination.ShortenIdentifier(oldNameCandidate, oldNameCandidate, destination.MaxIdentifierLength("clickhouse"))
 
-		renameOldSQL := fmt.Sprintf("RENAME TABLE %s.%s TO %s.%s", quoteIdentifier(targetDB), quoteIdentifier(targetName), quoteIdentifier(targetDB), quoteIdentifier(oldName))
+		renameOldSQL := fmt.Sprintf("RENAME TABLE %s.%s TO %s.%s%s", quoteIdentifier(targetDB), quoteIdentifier(targetName), quoteIdentifier(targetDB), quoteIdentifier(oldName), onCluster(d.cluster))
 		if err := d.conn.Exec(ctx, renameOldSQL); err != nil {
 			config.Debug("[CLICKHOUSE] No existing table to rename (this is OK for first run)")
 		}
 
-		renameNewSQL := fmt.Sprintf("RENAME TABLE %s.%s TO %s.%s", quoteIdentifier(stagingDB), quoteIdentifier(stagingName), quoteIdentifier(targetDB), quoteIdentifier(targetName))
+		renameNewSQL := fmt.Sprintf("RENAME TABLE %s.%s TO %s.%s%s", quoteIdentifier(stagingDB), quoteIdentifier(stagingName), quoteIdentifier(targetDB), quoteIdentifier(targetName), onCluster(d.cluster))
 		if err := d.conn.Exec(ctx, renameNewSQL); err != nil {
 			config.LogFailedQuery(renameNewSQL, err)
 			return fmt.Errorf("failed to rename staging to target: %w", err)
 		}
 
-		dropOldSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", quoteIdentifier(targetDB), quoteIdentifier(oldName))
+		dropOldSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s.%s%s", quoteIdentifier(targetDB), quoteIdentifier(oldName), onCluster(d.cluster))
 		_ = d.conn.Exec(ctx, dropOldSQL)
 	}
 
@@ -670,10 +680,11 @@ func (d *ClickHouseDestination) GetTableSchema(ctx context.Context, table string
 	}, nil
 }
 
-func parseClickHouseURI(uri string) (*clickhouse.Options, string, string, map[string]string, error) {
+// Returns opts, database, engineType, engineSettings, cluster, error.
+func parseClickHouseURI(uri string) (*clickhouse.Options, string, string, map[string]string, string, error) {
 	parsed, err := url.Parse(uri)
 	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("invalid URI: %w", err)
+		return nil, "", "", nil, "", fmt.Errorf("invalid URI: %w", err)
 	}
 
 	host := parsed.Hostname()
@@ -722,6 +733,7 @@ func parseClickHouseURI(uri string) (*clickhouse.Options, string, string, map[st
 	}
 
 	engineType := query.Get("engine")
+	cluster := query.Get("cluster")
 	engineSettings := map[string]string{}
 	for key, values := range query {
 		if !strings.HasPrefix(key, "engine.") || len(values) == 0 {
@@ -730,7 +742,19 @@ func parseClickHouseURI(uri string) (*clickhouse.Options, string, string, map[st
 		engineSettings[strings.TrimPrefix(key, "engine.")] = values[0]
 	}
 
-	return opts, database, engineType, engineSettings, nil
+	return opts, database, engineType, engineSettings, cluster, nil
+}
+
+// onCluster renders the ON CLUSTER clause, or nothing when running single-node.
+//
+// ⚠️ Every DDL that participates in the staging->swap path needs this. A CREATE that is
+// ON CLUSTER followed by an EXCHANGE that is not leaves the swap applied on one replica
+// only — the failure this exists to prevent, and one that reports success.
+func onCluster(cluster string) string {
+	if cluster == "" {
+		return ""
+	}
+	return " ON CLUSTER " + quoteIdentifier(cluster)
 }
 
 func (d *ClickHouseDestination) parseTableName(table string) (string, string) {
@@ -742,6 +766,10 @@ func (d *ClickHouseDestination) parseTableName(table string) (string, string) {
 }
 
 func buildCreateTableSQL(database, table string, columns []schema.Column, primaryKeys []string, engineType string, engineSettings map[string]string) string {
+	return buildCreateTableSQLForCluster(database, table, columns, primaryKeys, engineType, engineSettings, "")
+}
+
+func buildCreateTableSQLForCluster(database, table string, columns []schema.Column, primaryKeys []string, engineType string, engineSettings map[string]string, cluster string) string {
 	pkSet := make(map[string]bool)
 	for _, pk := range primaryKeys {
 		pkSet[strings.ToLower(pk)] = true
@@ -754,11 +782,11 @@ func buildCreateTableSQL(database, table string, columns []schema.Column, primar
 		colDefs = append(colDefs, fmt.Sprintf("%s %s", quoteIdentifier(col.Name), colType))
 	}
 
-	engine, isMergeTree := validateEngineType(engineType, len(primaryKeys) > 0)
+	engine, isMergeTree := validateEngineTypeForCluster(engineType, len(primaryKeys) > 0, cluster)
 
 	parts := []string{
-		fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s (\n  %s\n) ENGINE = %s",
-			quoteIdentifier(database), quoteIdentifier(table), strings.Join(colDefs, ",\n  "), engine),
+		fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s.%s%s (\n  %s\n) ENGINE = %s",
+			quoteIdentifier(database), quoteIdentifier(table), onCluster(cluster), strings.Join(colDefs, ",\n  "), engine),
 	}
 
 	if isMergeTree {
@@ -790,9 +818,19 @@ var engineTypeMap = map[string]struct {
 	"replacing_merge_tree":  {"ReplacingMergeTree()", true},
 	"shared_merge_tree":     {"SharedMergeTree()", true},
 	"replicated_merge_tree": {"ReplicatedMergeTree()", true},
+	// Argument-less like its siblings: the keeper path and replica name come from the
+	// server's default_replica_path / default_replica_name.
+	"replicated_replacing_merge_tree": {"ReplicatedReplacingMergeTree()", true},
 }
 
 func validateEngineType(engineType string, hasPrimaryKeys bool) (string, bool) {
+	return validateEngineTypeForCluster(engineType, hasPrimaryKeys, "")
+}
+
+// validateEngineTypeForCluster picks the engine. When cluster is set and the caller did
+// not ask for a specific engine, the default becomes the Replicated variant: a plain
+// MergeTree on a replicated cluster exists on one replica only, and nothing reports that.
+func validateEngineTypeForCluster(engineType string, hasPrimaryKeys bool, cluster string) (string, bool) {
 	if engineType != "" {
 		if e, ok := engineTypeMap[strings.ToLower(engineType)]; ok {
 			return e.name, e.mergeTree
@@ -803,6 +841,12 @@ func validateEngineType(engineType string, hasPrimaryKeys bool) (string, bool) {
 		}
 		sort.Strings(valid)
 		output.Warnf("[WARNING] unsupported ClickHouse engine %q, defaulting based on primary keys (valid: %s)\n", engineType, strings.Join(valid, ", "))
+	}
+	if cluster != "" {
+		if hasPrimaryKeys {
+			return "ReplicatedReplacingMergeTree()", true
+		}
+		return "ReplicatedMergeTree()", true
 	}
 	if hasPrimaryKeys {
 		return "ReplacingMergeTree()", true

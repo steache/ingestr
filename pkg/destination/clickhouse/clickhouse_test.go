@@ -225,7 +225,7 @@ func TestParseClickHouseURI_Engine(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, _, engineType, engineSettings, err := parseClickHouseURI(tt.uri)
+			_, _, engineType, engineSettings, _, err := parseClickHouseURI(tt.uri)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -404,5 +404,98 @@ func TestBeginTransactionUnsupported(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does not support transactions") {
 		t.Fatalf("BeginTransaction() error = %v, want transaction unsupported error", err)
+	}
+}
+
+// On a replicated cluster every DDL in the staging->swap path must carry ON CLUSTER.
+// A CREATE that is ON CLUSTER followed by an EXCHANGE that is not leaves the swap applied
+// on the connected replica only: it ends up holding the former staging table while the
+// others keep the original, diverging silently while the run reports success.
+func TestBuildCreateTableSQLForCluster(t *testing.T) {
+	t.Parallel()
+
+	cols := []schema.Column{{Name: "id", DataType: schema.TypeString}}
+
+	got := buildCreateTableSQLForCluster("db", "t", cols, []string{"id"}, "", nil, "mycluster")
+	if !strings.Contains(got, "ON CLUSTER `mycluster`") {
+		t.Errorf("expected ON CLUSTER clause, got:\n%s", got)
+	}
+	// A plain engine on a cluster exists on one replica only, so the default must change.
+	if !strings.Contains(got, "ReplicatedReplacingMergeTree()") {
+		t.Errorf("expected a Replicated engine by default on a cluster, got:\n%s", got)
+	}
+
+	// Unset cluster must leave single-node behaviour byte-identical.
+	plain := buildCreateTableSQLForCluster("db", "t", cols, []string{"id"}, "", nil, "")
+	if strings.Contains(plain, "ON CLUSTER") {
+		t.Errorf("no cluster configured should emit no ON CLUSTER clause, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "ReplacingMergeTree()") || strings.Contains(plain, "Replicated") {
+		t.Errorf("single-node default should stay ReplacingMergeTree, got:\n%s", plain)
+	}
+	if plain != buildCreateTableSQL("db", "t", cols, []string{"id"}, "", nil) {
+		t.Error("the cluster-aware builder must match the original when no cluster is set")
+	}
+}
+
+func TestOnClusterClause(t *testing.T) {
+	t.Parallel()
+
+	if got := onCluster(""); got != "" {
+		t.Errorf("empty cluster should produce no clause, got %q", got)
+	}
+	if got := onCluster("abc"); got != " ON CLUSTER `abc`" {
+		t.Errorf("onCluster = %q", got)
+	}
+}
+
+// The replicated deduplicating engine was previously unreachable: the map had
+// replacing_merge_tree and replicated_merge_tree but not the combination, so a replicated
+// table that dedups on a primary key could not be requested by any URI.
+func TestReplicatedReplacingEngineIsReachable(t *testing.T) {
+	t.Parallel()
+
+	got, isMergeTree := validateEngineType("replicated_replacing_merge_tree", true)
+	if got != "ReplicatedReplacingMergeTree()" {
+		t.Errorf("engine = %q", got)
+	}
+	if !isMergeTree {
+		t.Error("expected a MergeTree-family engine")
+	}
+}
+
+func TestParseClickHouseURICluster(t *testing.T) {
+	t.Parallel()
+
+	_, _, _, _, cluster, err := parseClickHouseURI("clickhouse://u:p@h:9000/db?cluster=mycluster")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cluster != "mycluster" {
+		t.Errorf("cluster = %q, want mycluster", cluster)
+	}
+
+	_, _, _, _, none, err := parseClickHouseURI("clickhouse://u:p@h:9000/db")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if none != "" {
+		t.Errorf("cluster should default to empty, got %q", none)
+	}
+}
+
+// Creating tables ON CLUSTER while their database exists on one replica only fails with
+// "Code: 81 ... Database <db> does not exist" on every other replica. The database and the
+// tables in it must be created with the same scope.
+func TestEnsureDatabaseUsesClusterScope(t *testing.T) {
+	t.Parallel()
+
+	withCluster := "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier("_bruin_staging") + onCluster("abugo")
+	if !strings.Contains(withCluster, "ON CLUSTER `abugo`") {
+		t.Errorf("database DDL must carry ON CLUSTER when a cluster is set, got: %s", withCluster)
+	}
+	plain := "CREATE DATABASE IF NOT EXISTS " + quoteIdentifier("_bruin_staging") + onCluster("")
+	if strings.Contains(plain, "ON CLUSTER") {
+		t.Errorf("single-node must be unchanged, got: %s", plain)
 	}
 }
